@@ -1,0 +1,5 @@
+{
+  "name": "Minecraft Mod Builder",
+  "description": "Upload a zip containing your Minecraft mod source code, and this app will build it into a ready-to-play .jar file.",
+  "requestFramePermissions": []
+}
