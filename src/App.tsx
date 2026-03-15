@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Upload, FileArchive, Loader2, CheckCircle, AlertCircle, Download } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -9,12 +9,20 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
+  const [showIntro, setShowIntro] = useState(true);
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'building' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setShowIntro(false);
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, []);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -119,6 +127,45 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30">
+      <AnimatePresence>
+        {showIntro && (
+          <motion.div
+            key="intro"
+            initial={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.8, ease: "easeInOut" }}
+            className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-zinc-950"
+          >
+            <motion.div
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ duration: 0.5, delay: 0.2 }}
+              className="flex flex-col items-center"
+            >
+              <div className="p-6 bg-emerald-500/10 rounded-3xl mb-6 ring-1 ring-emerald-500/20">
+                <FileArchive className="w-16 h-16 text-emerald-400 animate-pulse" />
+              </div>
+              <h1 className="text-3xl font-bold text-zinc-100 tracking-tight mb-2">
+                Minecraft Mod Builder
+              </h1>
+              <div className="flex items-center space-x-3 mt-8">
+                <Loader2 className="w-5 h-5 text-emerald-500 animate-spin" />
+                <span className="text-zinc-400 font-medium tracking-widest uppercase text-sm">Initializing Environment</span>
+              </div>
+            </motion.div>
+            
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.8 }}
+              className="absolute bottom-10 text-zinc-500 text-sm font-medium tracking-wide"
+            >
+              Build by <span className="text-emerald-400">eimithut</span>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <div className="max-w-3xl mx-auto px-6 py-24">
         
         <header className="mb-16 text-center">
