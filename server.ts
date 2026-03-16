@@ -70,6 +70,40 @@ app.post('/api/build', upload.single('sourceZip'), async (req, res) => {
     }
     projectDir = foundDir;
 
+    // 3.5 Auto-patch common mapping issues
+    async function patchJavaFiles(dir: string) {
+      const files = await fs.readdir(dir);
+      for (const file of files) {
+        const fullPath = path.join(dir, file);
+        const stat = await fs.stat(fullPath);
+        if (stat.isDirectory()) {
+          await patchJavaFiles(fullPath);
+        } else if (fullPath.endsWith('.java')) {
+          let content = await fs.readFile(fullPath, 'utf8');
+          let modified = false;
+          
+          // Patch NativeImage getColorArgb -> getColor
+          if (content.includes('getColorArgb')) {
+            content = content.replace(/getColorArgb/g, 'getColor');
+            modified = true;
+          }
+          // Patch NativeImage setColorArgb -> setColor
+          if (content.includes('setColorArgb')) {
+            content = content.replace(/setColorArgb/g, 'setColor');
+            modified = true;
+          }
+          
+          if (modified) {
+            console.log(`Auto-patched ${fullPath}`);
+            await fs.writeFile(fullPath, content, 'utf8');
+          }
+        }
+      }
+    }
+    
+    console.log('Running auto-patcher on Java files...');
+    await patchJavaFiles(projectDir);
+
     // 4. Run gradle build
     let buildCommand = '';
     const gradlewPath = path.join(projectDir, 'gradlew');

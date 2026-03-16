@@ -1,11 +1,24 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FileArchive, Loader2, CheckCircle, AlertCircle, Download } from 'lucide-react';
+import { Upload, FileArchive, Loader2, CheckCircle, AlertCircle, Download, Globe, User, Clock, ExternalLink } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { db, storage } from './firebase';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+interface SharedMod {
+  id: string;
+  name: string;
+  description?: string;
+  author: string;
+  createdAt: any;
+  downloadUrl: string;
+  version?: string;
 }
 
 export default function App() {
@@ -15,6 +28,11 @@ export default function App() {
   const [status, setStatus] = useState<'idle' | 'uploading' | 'building' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [isSharing, setIsSharing] = useState(false);
+  const [sharedSuccessfully, setSharedSuccessfully] = useState(false);
+  const [galleryMods, setGalleryMods] = useState<SharedMod[]>([]);
+  const [authorName, setAuthorName] = useState('');
+  const [modDescription, setModDescription] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -22,6 +40,20 @@ export default function App() {
       setShowIntro(false);
     }, 2500);
     return () => clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const q = query(collection(db, 'mods'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const mods = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as SharedMod[];
+      setGalleryMods(mods);
+    }, (error) => {
+      console.error("Gallery fetch error:", error);
+    });
+    return () => unsubscribe();
   }, []);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -120,8 +152,49 @@ export default function App() {
     setStatus('idle');
     setErrorMessage('');
     setDownloadUrl(null);
+    setSharedSuccessfully(false);
+    setModDescription('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+  };
+
+  const handleShareToGallery = async () => {
+    if (!downloadUrl || !file) return;
+    if (!authorName.trim()) {
+      alert("Please enter your name to share!");
+      return;
+    }
+
+    setIsSharing(true);
+    try {
+      // 1. Fetch the blob from the temporary URL
+      const response = await fetch(downloadUrl);
+      const blob = await response.blob();
+      
+      // 2. Upload the blob to Firebase Storage
+      const fileName = `mods/${Date.now()}_${file.name}`;
+      const storageRef = ref(storage, fileName);
+      const uploadResult = await uploadBytes(storageRef, blob);
+      
+      // 3. Get the permanent public download URL
+      const permanentUrl = await getDownloadURL(uploadResult.ref);
+
+      // 4. Save metadata to Firestore with the PERMANENT URL
+      await addDoc(collection(db, 'mods'), {
+        name: file.name.replace('.zip', ''),
+        author: authorName,
+        description: modDescription,
+        createdAt: serverTimestamp(),
+        downloadUrl: permanentUrl, // This is now a permanent cloud link!
+        version: '1.20.1'
+      });
+      setSharedSuccessfully(true);
+    } catch (error) {
+      console.error("Error sharing mod:", error);
+      alert("Failed to share mod to gallery. Make sure your Firebase Storage is configured.");
+    } finally {
+      setIsSharing(false);
     }
   };
 
@@ -350,10 +423,134 @@ export default function App() {
                     Build Another
                   </button>
                 </div>
+
+                {!sharedSuccessfully ? (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-12 p-8 bg-zinc-950/50 border border-zinc-800 rounded-3xl w-full max-w-lg"
+                  >
+                    <h3 className="text-xl font-semibold text-zinc-100 mb-4 flex items-center gap-2">
+                      <Globe className="w-5 h-5 text-emerald-400" />
+                      Share to Global Gallery?
+                    </h3>
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5 ml-1">
+                          Creator Name
+                        </label>
+                        <input 
+                          type="text"
+                          placeholder="Your name"
+                          value={authorName}
+                          onChange={(e) => setAuthorName(e.target.value)}
+                          className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500/50 transition-all"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5 ml-1">
+                          Description (Optional)
+                        </label>
+                        <textarea 
+                          placeholder="What does this mod do?"
+                          value={modDescription}
+                          onChange={(e) => setModDescription(e.target.value)}
+                          className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500/50 transition-all h-24 resize-none"
+                        />
+                      </div>
+                      <button
+                        onClick={handleShareToGallery}
+                        disabled={isSharing || !authorName.trim()}
+                        className="w-full py-4 bg-zinc-100 text-zinc-950 rounded-xl font-bold hover:bg-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                      >
+                        {isSharing ? (
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                        ) : (
+                          <>
+                            <Globe className="w-5 h-5" />
+                            Upload to Gallery
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </motion.div>
+                ) : (
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="mt-12 p-6 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-emerald-400 flex items-center gap-3"
+                  >
+                    <CheckCircle className="w-5 h-5" />
+                    <span className="font-medium">Shared to global gallery successfully!</span>
+                  </motion.div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
         </main>
+
+        <section className="mt-32">
+          <div className="flex items-center justify-between mb-8">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-emerald-500/10 rounded-lg">
+                <Globe className="w-6 h-6 text-emerald-400" />
+              </div>
+              <h2 className="text-2xl font-bold text-zinc-100">Global Mod Gallery</h2>
+            </div>
+            <span className="text-zinc-500 text-sm font-medium">
+              {galleryMods.length} Mods Shared
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {galleryMods.length > 0 ? (
+              galleryMods.map((mod) => (
+                <motion.div
+                  key={mod.id}
+                  initial={{ opacity: 0, y: 20 }}
+                  whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true }}
+                  className="bg-zinc-900/40 border border-zinc-800/50 rounded-3xl p-6 hover:border-zinc-700 transition-colors group"
+                >
+                  <div className="flex justify-between items-start mb-4">
+                    <div className="p-3 bg-zinc-800 rounded-2xl text-emerald-400 group-hover:scale-110 transition-transform">
+                      <FileArchive className="w-6 h-6" />
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500 bg-zinc-800/50 px-3 py-1 rounded-full">
+                      <Clock className="w-3 h-3" />
+                      {mod.createdAt?.toDate ? mod.createdAt.toDate().toLocaleDateString() : 'Just now'}
+                    </div>
+                  </div>
+                  
+                  <h3 className="text-xl font-bold text-zinc-100 mb-2">{mod.name}</h3>
+                  <p className="text-zinc-400 text-sm line-clamp-2 mb-6 h-10">
+                    {mod.description || 'No description provided.'}
+                  </p>
+                  
+                  <div className="flex items-center justify-between pt-4 border-t border-zinc-800/50">
+                    <div className="flex items-center gap-2 text-zinc-300">
+                      <User className="w-4 h-4 text-emerald-500" />
+                      <span className="text-sm font-medium">{mod.author}</span>
+                    </div>
+                    
+                    <a 
+                      href={mod.downloadUrl}
+                      download={`${mod.name}.zip`}
+                      className="p-2 text-zinc-400 hover:text-emerald-400 transition-colors"
+                      title="Download Mod"
+                    >
+                      <Download className="w-5 h-5" />
+                    </a>
+                  </div>
+                </motion.div>
+              ))
+            ) : (
+              <div className="col-span-full py-20 text-center bg-zinc-900/20 border border-dashed border-zinc-800 rounded-3xl">
+                <p className="text-zinc-500 italic">No mods shared yet. Be the first!</p>
+              </div>
+            )}
+          </div>
+        </section>
         
       </div>
     </div>
