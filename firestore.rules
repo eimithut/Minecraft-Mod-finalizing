@@ -8,7 +8,7 @@
 //   - name: string (required, 1-100 chars)
 //   - description: string (optional, 0-500 chars)
 //   - author: string (required, 1-50 chars)
-//   - createdAt: string (required, ISO 8601)
+//   - createdAt: timestamp (required)
 //   - downloadUrl: string (required, URL)
 //   - version: string (optional)
 //
@@ -27,7 +27,7 @@ service cloud.firestore {
       return data.keys().hasAll(['name', 'author', 'createdAt', 'downloadUrl']) &&
              data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
              data.author is string && data.author.size() > 0 && data.author.size() <= 50 &&
-             data.createdAt is string &&
+             data.createdAt is timestamp &&
              data.downloadUrl is string && data.downloadUrl.matches("^https?://.*") &&
              (!('description' in data) || (data.description is string && data.description.size() <= 500)) &&
              (!('version' in data) || (data.version is string));

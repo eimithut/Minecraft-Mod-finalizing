@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { db, storage } from './firebase';
 
 function cn(...inputs: ClassValue[]) {
@@ -29,6 +29,8 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [isSharing, setIsSharing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState('');
   const [sharedSuccessfully, setSharedSuccessfully] = useState(false);
   const [galleryMods, setGalleryMods] = useState<SharedMod[]>([]);
   const [authorName, setAuthorName] = useState('');
@@ -104,46 +106,71 @@ export default function App() {
     setStatus('uploading');
     setErrorMessage('');
     setDownloadUrl(null);
+    setProgress(10);
+    setStatusMessage('Preparing source files...');
 
     const formData = new FormData();
     formData.append('sourceZip', file);
 
     try {
-      setStatus('building');
-      
-      const response = await fetch('/api/build', {
+      console.log('Starting upload...');
+      // 1. Start the build job
+      const startResponse = await fetch('/api/build', {
         method: 'POST',
         body: formData,
       });
 
-      if (!response.ok) {
-        let errorText = 'Build failed';
+      console.log('Upload response received:', startResponse.status);
+
+      if (!startResponse.ok) {
+        const errorData = await startResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to start build job');
+      }
+
+      const { jobId } = await startResponse.json();
+      console.log('Job started with ID:', jobId);
+      setStatus('building');
+
+      // 2. Poll for status
+      const pollStatus = async () => {
         try {
-          const errorData = await response.json();
-          errorText = errorData.error || errorText;
-        } catch (e) {
-          errorText = await response.text() || errorText;
+          const statusResponse = await fetch(`/api/build/status/${jobId}`);
+          if (!statusResponse.ok) {
+            throw new Error('Failed to check build status');
+          }
+
+          const job = await statusResponse.json();
+          
+          if (job.status === 'error') {
+            throw new Error(job.error || 'Build failed');
+          }
+
+          setProgress(job.progress);
+          setStatusMessage(job.message);
+
+          if (job.status === 'success') {
+            // 3. Build finished, set success and download URL
+            setDownloadUrl(`/api/build/download/${jobId}`);
+            setStatus('success');
+            return;
+          }
+
+          // Continue polling
+          setTimeout(pollStatus, 2000);
+        } catch (err: any) {
+          setStatus('error');
+          setErrorMessage(err.message || 'An error occurred during the build.');
+          setProgress(0);
         }
-        throw new Error(errorText);
-      }
+      };
 
-      const contentType = response.headers.get('content-type');
-      if (contentType && contentType.includes('text/html')) {
-        const html = await response.text();
-        console.error('Received HTML instead of zip:', html.substring(0, 500));
-        throw new Error('Server returned an HTML page instead of a zip file. This might be due to a session timeout, a proxy error, or the build taking too long. Please refresh the page and try again.');
-      }
-
-      // The response is a blob (the zip file)
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      setDownloadUrl(url);
-      setStatus('success');
+      pollStatus();
       
     } catch (error: any) {
       console.error('Build error:', error);
       setStatus('error');
       setErrorMessage(error.message || 'An unexpected error occurred during the build.');
+      setProgress(0);
     }
   };
 
@@ -167,6 +194,9 @@ export default function App() {
     }
 
     setIsSharing(true);
+    setProgress(0);
+    setStatusMessage('Preparing upload...');
+    
     try {
       // 1. Fetch the blob from the temporary URL
       const response = await fetch(downloadUrl);
@@ -175,12 +205,32 @@ export default function App() {
       // 2. Upload the blob to Firebase Storage
       const fileName = `mods/${Date.now()}_${file.name}`;
       const storageRef = ref(storage, fileName);
-      const uploadResult = await uploadBytes(storageRef, blob);
+      
+      setStatusMessage('Uploading to cloud storage...');
+      const uploadTask = uploadBytesResumable(storageRef, blob);
+
+      await new Promise<void>((resolve, reject) => {
+        uploadTask.on('state_changed', 
+          (snapshot) => {
+            const p = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            setProgress(p);
+            if (p < 100) {
+              setStatusMessage(`Uploading: ${Math.round(p)}%`);
+            } else {
+              setStatusMessage('Finalizing cloud storage...');
+            }
+          }, 
+          (error) => reject(error), 
+          () => resolve()
+        );
+      });
       
       // 3. Get the permanent public download URL
-      const permanentUrl = await getDownloadURL(uploadResult.ref);
+      setStatusMessage('Generating public link...');
+      const permanentUrl = await getDownloadURL(uploadTask.snapshot.ref);
 
       // 4. Save metadata to Firestore with the PERMANENT URL
+      setStatusMessage('Saving to gallery database...');
       await addDoc(collection(db, 'mods'), {
         name: file.name.replace('.zip', ''),
         author: authorName,
@@ -189,10 +239,14 @@ export default function App() {
         downloadUrl: permanentUrl, // This is now a permanent cloud link!
         version: '1.20.1'
       });
+      
+      setProgress(100);
+      setStatusMessage('Shared successfully!');
       setSharedSuccessfully(true);
     } catch (error) {
       console.error("Error sharing mod:", error);
       alert("Failed to share mod to gallery. Make sure your Firebase Storage is configured.");
+      setProgress(0);
     } finally {
       setIsSharing(false);
     }
@@ -366,22 +420,33 @@ export default function App() {
                   <Loader2 className="w-16 h-16 text-emerald-400 animate-spin relative z-10" />
                 </div>
                 
-                <div className="space-y-2">
-                  <h2 className="text-2xl font-semibold text-zinc-100">
-                    {status === 'uploading' ? 'Uploading Source...' : 'Building Mod...'}
-                  </h2>
-                  <p className="text-zinc-400">
-                    {status === 'uploading' 
-                      ? 'Transferring your files securely.' 
-                      : 'Running Gradle build. This might take a minute or two depending on dependencies.'}
-                  </p>
-                </div>
-                
-                {status === 'building' && (
-                  <div className="w-full max-w-md bg-zinc-950 rounded-full h-2 overflow-hidden border border-zinc-800">
-                    <div className="h-full bg-emerald-500 w-full origin-left animate-[pulse_2s_ease-in-out_infinite]" />
+                <div className="space-y-4 w-full">
+                  <div className="space-y-2">
+                    <h2 className="text-2xl font-semibold text-zinc-100">
+                      {statusMessage || (status === 'uploading' ? 'Uploading Source...' : 'Building Mod...')}
+                    </h2>
+                    <p className="text-zinc-400 text-sm">
+                      {status === 'uploading' 
+                        ? 'Transferring your files securely.' 
+                        : 'Running Gradle build. This might take a minute or two depending on dependencies.'}
+                    </p>
                   </div>
-                )}
+                  
+                  <div className="w-full max-w-md mx-auto space-y-2">
+                    <div className="flex justify-between text-xs font-mono text-zinc-500">
+                      <span>PROGRESS</span>
+                      <span>{Math.round(progress)}%</span>
+                    </div>
+                    <div className="w-full bg-zinc-950 rounded-full h-3 overflow-hidden border border-zinc-800 p-0.5">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${progress}%` }}
+                        transition={{ duration: 0.5 }}
+                        className="h-full bg-emerald-500 rounded-full shadow-[0_0_10px_rgba(16,185,129,0.3)]" 
+                      />
+                    </div>
+                  </div>
+                </div>
               </motion.div>
             ) : (
               <motion.div
@@ -461,16 +526,23 @@ export default function App() {
                       <button
                         onClick={handleShareToGallery}
                         disabled={isSharing || !authorName.trim()}
-                        className="w-full py-4 bg-zinc-100 text-zinc-950 rounded-xl font-bold hover:bg-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                        className="w-full py-4 bg-zinc-100 text-zinc-950 rounded-xl font-bold hover:bg-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex flex-col items-center justify-center gap-2 overflow-hidden relative"
                       >
-                        {isSharing ? (
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                        ) : (
-                          <>
-                            <Globe className="w-5 h-5" />
-                            Upload to Gallery
-                          </>
+                        {isSharing && (
+                          <motion.div 
+                            initial={{ width: 0 }}
+                            animate={{ width: `${progress}%` }}
+                            className="absolute inset-0 bg-emerald-500/20 pointer-events-none"
+                          />
                         )}
+                        <div className="flex items-center gap-2 relative z-10">
+                          {isSharing ? (
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                          ) : (
+                            <Globe className="w-5 h-5" />
+                          )}
+                          <span>{isSharing ? statusMessage : 'Upload to Gallery'}</span>
+                        </div>
                       </button>
                     </div>
                   </motion.div>
