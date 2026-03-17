@@ -29,6 +29,10 @@
         "version": {
           "type": "string",
           "description": "Minecraft version"
+        },
+        "uid": {
+          "type": "string",
+          "description": "The user ID of the creator"
         }
       },
       "required": ["name", "author", "createdAt", "downloadUrl"]

@@ -40,7 +40,7 @@ export default function App() {
   useEffect(() => {
     const timer = setTimeout(() => {
       setShowIntro(false);
-    }, 2500);
+    }, 800); // Reduced from 2500ms to 800ms for faster access
     return () => clearTimeout(timer);
   }, []);
 
@@ -113,22 +113,17 @@ export default function App() {
     formData.append('sourceZip', file);
 
     try {
-      console.log('Starting upload...');
       // 1. Start the build job
       const startResponse = await fetch('/api/build', {
         method: 'POST',
         body: formData,
       });
 
-      console.log('Upload response received:', startResponse.status);
-
       if (!startResponse.ok) {
-        const errorData = await startResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to start build job');
+        throw new Error('Failed to start build job');
       }
 
       const { jobId } = await startResponse.json();
-      console.log('Job started with ID:', jobId);
       setStatus('building');
 
       // 2. Poll for status

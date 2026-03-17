@@ -33,12 +33,15 @@ service cloud.firestore {
              (!('version' in data) || (data.version is string));
     }
 
+    match /_connection_test/{docId} {
+      allow read: if true;
+    }
+
     match /mods/{modId} {
       // Allow anyone to read the gallery
       allow read: if true;
       
-      // Allow anyone to share a mod (for this demo, we don't require login to keep it accessible)
-      // but we validate the data strictly
+      // Allow anyone to share a mod (publicly accessible)
       allow create: if isValidMod(request.resource.data);
       
       // No updates or deletes allowed by users for now

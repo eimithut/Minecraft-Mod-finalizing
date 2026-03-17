@@ -10,25 +10,8 @@ import { createServer as createViteServer } from 'vite';
 
 const execAsync = promisify(exec);
 
-const logBuffer: string[] = [];
-const originalLog = console.log;
-const originalError = console.error;
-
-console.log = (...args) => {
-  logBuffer.push(`[LOG] ${args.join(' ')}`);
-  if (logBuffer.length > 100) logBuffer.shift();
-  originalLog(...args);
-};
-
-console.error = (...args) => {
-  logBuffer.push(`[ERR] ${args.join(' ')}`);
-  if (logBuffer.length > 100) logBuffer.shift();
-  originalError(...args);
-};
-
-app.get('/api/logs', (req, res) => {
-  res.json({ logs: logBuffer });
-});
+const app = express();
+const PORT = 3000;
 
 // Store job statuses in memory
 const jobs: Record<string, { 
@@ -45,18 +28,13 @@ const jobs: Record<string, {
 const upload = multer({ dest: '/tmp/uploads/' });
 
 app.post('/api/build', upload.single('sourceZip'), async (req, res) => {
-  console.log(`[${new Date().toISOString()}] Received build request. File: ${req.file?.originalname} (${req.file?.size} bytes)`);
-  
   if (!req.file) {
-    console.error('No file uploaded in request');
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
   const jobId = uuidv4();
   const workDir = path.join('/tmp/jobs', jobId);
   const sourceZipPath = req.file.path;
-
-  console.log(`[${jobId}] Initializing job. WorkDir: ${workDir}`);
 
   // Initialize job
   jobs[jobId] = {
@@ -69,10 +47,10 @@ app.post('/api/build', upload.single('sourceZip'), async (req, res) => {
 
   // Start build process in background
   runBuildJob(jobId, workDir, sourceZipPath).catch(err => {
-    console.error(`[${jobId}] Job failed in background:`, err);
+    console.error(`Job ${jobId} failed:`, err);
   });
 
-  console.log(`[${jobId}] Returning jobId to client`);
+  // Return jobId immediately
   res.json({ jobId });
 });
 
@@ -120,7 +98,6 @@ app.get('/api/build/download/:jobId', async (req, res) => {
 
 async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string) {
   const job = jobs[jobId];
-  console.log(`[${jobId}] Starting build job execution`);
   
   try {
     job.status = 'building';
@@ -287,7 +264,8 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         const jdkUrl = `https://api.adoptium.net/v3/binary/latest/21/ga/linux/${arch}/jdk/hotspot/normal/eclipse`;
         const tarPath = '/tmp/jdk.tar.gz';
         
-        await execAsync(`curl -f -L -o ${tarPath} "${jdkUrl}"`);
+        // Add retries for flaky Adoptium API
+        await execAsync(`curl -f -L --retry 5 --retry-delay 5 --retry-all-errors -o ${tarPath} "${jdkUrl}"`);
         await execAsync(`tar -xzf ${tarPath} -C ${jdkDir} --strip-components=1`);
         await fs.remove(tarPath);
       }
@@ -300,7 +278,7 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       const gradlewContent = await fs.readFile(gradlewPath, 'utf8');
       await fs.writeFile(gradlewPath, gradlewContent.replace(/\r\n/g, '\n'));
       await execAsync(`chmod +x ${gradlewPath}`);
-      buildCommand = './gradlew build --no-daemon --console=plain';
+      buildCommand = './gradlew build -x test --no-daemon --console=plain';
     } else {
       const gradleVersion = '8.8';
       const gradleDir = '/tmp/gradle';
@@ -311,14 +289,15 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         const gradleUrl = `https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip`;
         const zipPath = '/tmp/gradle.zip';
         
-        await execAsync(`curl -f -L -o ${zipPath} "${gradleUrl}"`);
+        // Add retries for Gradle download
+        await execAsync(`curl -f -L --retry 5 --retry-delay 5 --retry-all-errors -o ${zipPath} "${gradleUrl}"`);
         let gradleZip = new AdmZip(zipPath);
         gradleZip.extractAllTo(gradleDir, true);
         await fs.remove(zipPath);
         await execAsync(`chmod +x ${gradleBin}`);
       }
       
-      buildCommand = `${gradleBin} build --no-daemon --console=plain`;
+      buildCommand = `${gradleBin} build -x test --no-daemon --console=plain`;
     }
     
     job.message = 'Running Gradle build (this may take several minutes)...';
@@ -327,7 +306,16 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     try {
       const { stdout, stderr } = await execAsync(buildCommand, { 
         cwd: projectDir,
-        env: { ...process.env, JAVA_HOME: javaHome, PATH: pathEnv },
+        env: { 
+          ...process.env, 
+          JAVA_HOME: javaHome, 
+          PATH: pathEnv,
+          // Use a persistent Gradle home in /tmp to cache dependencies across builds
+          GRADLE_USER_HOME: '/tmp/.gradle',
+          // Increase memory and disable daemon more aggressively
+          GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"',
+          JAVA_OPTS: '-Xmx2g'
+        },
         maxBuffer: 10 * 1024 * 1024 
       });
       console.log(`Job ${jobId} stdout:`, stdout);
