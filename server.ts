@@ -4,7 +4,7 @@ import AdmZip from 'adm-zip';
 import { v4 as uuidv4 } from 'uuid';
 import fs from 'fs-extra';
 import path from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
 
@@ -21,7 +21,8 @@ const jobs: Record<string, {
   error?: string,
   resultPath?: string,
   workDir?: string,
-  sourceZipPath?: string
+  sourceZipPath?: string,
+  logs: string[]
 }> = {};
 
 // Configure multer for file uploads
@@ -42,7 +43,8 @@ app.post('/api/build', upload.single('sourceZip'), async (req, res) => {
     message: 'Job initialized',
     progress: 0,
     workDir,
-    sourceZipPath
+    sourceZipPath,
+    logs: ['[System] Job initialized']
   };
 
   // Start build process in background
@@ -66,7 +68,8 @@ app.get('/api/build/status/:jobId', (req, res) => {
     status: job.status,
     message: job.message,
     progress: job.progress,
-    error: job.error
+    error: job.error,
+    logs: job.logs
   });
 });
 
@@ -99,8 +102,15 @@ app.get('/api/build/download/:jobId', async (req, res) => {
 async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string) {
   const job = jobs[jobId];
   
+  const log = (msg: string) => {
+    console.log(`[Job ${jobId}] ${msg}`);
+    job.logs.push(msg);
+    if (job.logs.length > 500) job.logs.shift();
+  };
+  
   try {
     job.status = 'building';
+    log('Extracting source files...');
     job.message = 'Extracting source files...';
     job.progress = 10;
 
@@ -117,6 +127,7 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     zip.extractAllTo(workDir, true);
 
     // 3. Find the directory containing build.gradle
+    log('Locating project files...');
     job.message = 'Locating project files...';
     job.progress = 20;
     
@@ -148,6 +159,7 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     projectDir = foundDir;
 
     // 3.5 Auto-patch common mapping and dependency issues
+    log('Applying auto-patches for 1.21 compatibility...');
     job.message = 'Applying auto-patches...';
     job.progress = 30;
     
@@ -243,6 +255,7 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     await patchProjectFiles(projectDir);
 
     // 4. Run gradle build
+    log('Setting up build environment (JDK & Gradle)...');
     job.message = 'Setting up build environment...';
     job.progress = 40;
     
@@ -275,22 +288,26 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     }
 
     if (await fs.pathExists(gradlewPath)) {
+      log('Found gradlew, preparing execution...');
       const gradlewContent = await fs.readFile(gradlewPath, 'utf8');
       await fs.writeFile(gradlewPath, gradlewContent.replace(/\r\n/g, '\n'));
       await execAsync(`chmod +x ${gradlewPath}`);
       buildCommand = './gradlew build -x test --no-daemon --console=plain';
     } else {
+      log('Gradlew not found, setting up standalone Gradle 8.8...');
       const gradleVersion = '8.8';
       const gradleDir = '/tmp/gradle';
       const gradleBin = path.join(gradleDir, `gradle-${gradleVersion}`, 'bin', 'gradle');
       
       if (!await fs.pathExists(gradleBin)) {
+        log(`Downloading Gradle ${gradleVersion}...`);
         await fs.ensureDir(gradleDir);
         const gradleUrl = `https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip`;
         const zipPath = '/tmp/gradle.zip';
         
         // Add retries for Gradle download
         await execAsync(`curl -f -L --retry 5 --retry-delay 5 --retry-all-errors -o ${zipPath} "${gradleUrl}"`);
+        log('Extracting Gradle...');
         let gradleZip = new AdmZip(zipPath);
         gradleZip.extractAllTo(gradleDir, true);
         await fs.remove(zipPath);
@@ -300,30 +317,46 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       buildCommand = `${gradleBin} build -x test --no-daemon --console=plain`;
     }
     
-    job.message = 'Running Gradle build (this may take several minutes)...';
+    job.message = 'Running Gradle build...';
     job.progress = 50;
+    log(`Starting build with command: ${buildCommand}`);
     
-    try {
-      const { stdout, stderr } = await execAsync(buildCommand, { 
-        cwd: projectDir,
-        env: { 
-          ...process.env, 
-          JAVA_HOME: javaHome, 
-          PATH: pathEnv,
-          // Use a persistent Gradle home in /tmp to cache dependencies across builds
-          GRADLE_USER_HOME: '/tmp/.gradle',
-          // Increase memory and disable daemon more aggressively
-          GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m"',
-          JAVA_OPTS: '-Xmx2g'
-        },
-        maxBuffer: 10 * 1024 * 1024 
+    const buildProcess = spawn('/bin/sh', ['-c', buildCommand], { 
+      cwd: projectDir,
+      env: { 
+        ...process.env, 
+        JAVA_HOME: javaHome, 
+        PATH: pathEnv,
+        // Use a persistent Gradle home in /tmp to cache dependencies across builds
+        GRADLE_USER_HOME: '/tmp/.gradle',
+        // Aggressively limit memory for 512MB RAM environments
+        // -Xmx320m leaves room for the Node.js process and OS
+        GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"',
+        JAVA_OPTS: '-Xmx320m'
+      }
+    });
+
+    buildProcess.stdout.on('data', (data: any) => {
+      data.toString().split('\n').forEach((line: string) => {
+        if (line.trim()) log(line.trim());
       });
-      console.log(`Job ${jobId} stdout:`, stdout);
-    } catch (error: any) {
-      throw new Error(`Build failed: ${error.message}\n\nStdout: ${error.stdout}\n\nStderr: ${error.stderr}`);
-    }
+    });
+
+    buildProcess.stderr.on('data', (data: any) => {
+      data.toString().split('\n').forEach((line: string) => {
+        if (line.trim()) log(`[Error] ${line.trim()}`);
+      });
+    });
+
+    await new Promise((resolve, reject) => {
+      buildProcess.on('close', (code: number) => {
+        if (code === 0) resolve(null);
+        else reject(new Error(`Gradle build failed with exit code ${code}`));
+      });
+    });
 
     // 5. Find the resulting .jar file
+    log('Build successful! Packaging build artifacts...');
     job.message = 'Packaging build artifacts...';
     job.progress = 90;
     

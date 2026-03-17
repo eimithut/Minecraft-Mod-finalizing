@@ -31,11 +31,28 @@ export default function App() {
   const [isSharing, setIsSharing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
+  const [logs, setLogs] = useState<string[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
   const [sharedSuccessfully, setSharedSuccessfully] = useState(false);
   const [galleryMods, setGalleryMods] = useState<SharedMod[]>([]);
   const [authorName, setAuthorName] = useState('');
   const [modDescription, setModDescription] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (logsContainerRef.current) {
+      const { scrollHeight, clientHeight, scrollTop } = logsContainerRef.current;
+      const isAtBottom = scrollHeight - clientHeight <= scrollTop + 50;
+      
+      if (isAtBottom) {
+        logsContainerRef.current.scrollTo({
+          top: scrollHeight,
+          behavior: 'smooth'
+        });
+      }
+    }
+  }, [logs]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -108,6 +125,8 @@ export default function App() {
     setDownloadUrl(null);
     setProgress(10);
     setStatusMessage('Preparing source files...');
+    setLogs(['[System] Preparing source files...']);
+    setShowLogs(true);
 
     const formData = new FormData();
     formData.append('sourceZip', file);
@@ -135,6 +154,10 @@ export default function App() {
           }
 
           const job = await statusResponse.json();
+          
+          if (job.logs) {
+            setLogs(job.logs);
+          }
           
           if (job.status === 'error') {
             throw new Error(job.error || 'Build failed');
@@ -176,6 +199,8 @@ export default function App() {
     setDownloadUrl(null);
     setSharedSuccessfully(false);
     setModDescription('');
+    setLogs([]);
+    setShowLogs(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -427,18 +452,66 @@ export default function App() {
                     </p>
                   </div>
                   
-                  <div className="w-full max-w-md mx-auto space-y-2">
-                    <div className="flex justify-between text-xs font-mono text-zinc-500">
-                      <span>PROGRESS</span>
-                      <span>{Math.round(progress)}%</span>
+                  <div className="w-full max-w-md mx-auto space-y-6">
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-xs font-mono text-zinc-500">
+                        <span>PROGRESS</span>
+                        <span>{Math.round(progress)}%</span>
+                      </div>
+                      <div className="w-full bg-zinc-950 rounded-full h-3 overflow-hidden border border-zinc-800 p-0.5">
+                        <motion.div 
+                          initial={{ width: 0 }}
+                          animate={{ width: `${progress}%` }}
+                          transition={{ duration: 0.5 }}
+                          className="h-full bg-emerald-500 rounded-full shadow-[0_0_10px_rgba(16,185,129,0.3)]" 
+                        />
+                      </div>
                     </div>
-                    <div className="w-full bg-zinc-950 rounded-full h-3 overflow-hidden border border-zinc-800 p-0.5">
-                      <motion.div 
-                        initial={{ width: 0 }}
-                        animate={{ width: `${progress}%` }}
-                        transition={{ duration: 0.5 }}
-                        className="h-full bg-emerald-500 rounded-full shadow-[0_0_10px_rgba(16,185,129,0.3)]" 
-                      />
+
+                    {/* Build Console */}
+                    <div className="space-y-3 text-left w-full">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center">
+                          <Clock className="w-3 h-3 mr-2" />
+                          Build Console
+                        </h3>
+                        <button 
+                          onClick={() => setShowLogs(!showLogs)}
+                          className="text-[10px] font-bold text-emerald-400 hover:text-emerald-300 transition-colors uppercase tracking-widest"
+                        >
+                          {showLogs ? 'Hide Logs' : 'Show Logs'}
+                        </button>
+                      </div>
+                      
+                      <AnimatePresence>
+                        {showLogs && (
+                          <motion.div
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="bg-zinc-950 rounded-2xl border border-zinc-800 overflow-hidden shadow-2xl"
+                          >
+                            <div 
+                              ref={logsContainerRef}
+                              className="h-48 overflow-y-auto p-4 font-mono text-[10px] leading-relaxed space-y-1 scrollbar-thin scrollbar-thumb-zinc-800"
+                            >
+                              {logs.length === 0 ? (
+                                <div className="text-zinc-600 italic">Waiting for logs...</div>
+                              ) : (
+                                logs.map((log, i) => (
+                                  <div key={i} className={cn(
+                                    "whitespace-pre-wrap break-all",
+                                    log.startsWith('[Error]') ? "text-red-400" : 
+                                    log.startsWith('[System]') ? "text-emerald-400 font-bold" : "text-zinc-400"
+                                  )}>
+                                    {log}
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   </div>
                 </div>
