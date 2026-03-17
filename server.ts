@@ -267,8 +267,36 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
             modified = true;
           }
           
+          // Disable configuration cache as it can cause serialization issues in low-memory
+          if (!content.includes('org.gradle.configuration-cache')) {
+            content += '\norg.gradle.configuration-cache=false\n';
+            modified = true;
+          } else {
+            content = content.replace(/org\.gradle\.configuration-cache\s*=\s*.*/g, 'org.gradle.configuration-cache=false');
+            modified = true;
+          }
+
+          // Disable VFS watching in properties
+          if (!content.includes('org.gradle.vfs.watch')) {
+            content += '\norg.gradle.vfs.watch=false\n';
+            modified = true;
+          }
+          
           if (modified) {
             await fs.writeFile(fullPath, content, 'utf8');
+          }
+        } else if (file === 'gradle-wrapper.properties') {
+          let content = await fs.readFile(fullPath, 'utf8');
+          
+          // If the wrapper version is too old for Java 21, we might want to warn or force standalone
+          // For now, just log it if we can detect it
+          const versionMatch = content.match(/gradle-(.*?)-(bin|all)\.zip/);
+          if (versionMatch) {
+            const version = versionMatch[1];
+            const major = parseInt(version.split('.')[0]);
+            if (major < 8) {
+              log(`[System] Warning: Gradle ${version} might be too old for Java 21. If the build fails, try updating your wrapper to 8.x.`);
+            }
           }
         } else if (file === 'settings.gradle' || file === 'settings.gradle.kts') {
           let content = await fs.readFile(fullPath, 'utf8');
@@ -321,14 +349,40 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       pathEnv = `${path.join(jdkDir, 'bin')}:${process.env.PATH}`;
     }
 
-    if (await fs.pathExists(gradlewPath)) {
-      log('Found gradlew, preparing execution...');
+    const wrapperFiles = [
+      { name: 'gradlew', path: path.join(projectDir, 'gradlew') },
+      { name: 'gradlew.bat', path: path.join(projectDir, 'gradlew.bat') },
+      { name: 'gradle-wrapper.jar', path: path.join(projectDir, 'gradle', 'wrapper', 'gradle-wrapper.jar') },
+      { name: 'gradle-wrapper.properties', path: path.join(projectDir, 'gradle', 'wrapper', 'gradle-wrapper.properties') }
+    ];
+
+    const foundFiles = [];
+    const missingFiles = [];
+
+    for (const file of wrapperFiles) {
+      if (await fs.pathExists(file.path)) {
+        foundFiles.push(file.name);
+      } else {
+        missingFiles.push(file.name);
+      }
+    }
+
+    if (foundFiles.length > 0) {
+      log(`[System] Gradle Wrapper detection: Found (${foundFiles.join(', ')}). Missing (${missingFiles.length > 0 ? missingFiles.join(', ') : 'none'}).`);
+    }
+
+    if (await fs.pathExists(gradlewPath) && await fs.pathExists(path.join(projectDir, 'gradle', 'wrapper', 'gradle-wrapper.jar'))) {
+      log('Found gradlew and wrapper JAR, preparing execution...');
       const gradlewContent = await fs.readFile(gradlewPath, 'utf8');
       await fs.writeFile(gradlewPath, gradlewContent.replace(/\r\n/g, '\n'));
       await execAsync(`chmod +x ${gradlewPath}`);
       buildCommand = './gradlew build -x test --no-daemon --console=plain';
     } else {
-      log('Gradlew not found, setting up standalone Gradle 8.8...');
+      if (await fs.pathExists(gradlewPath)) {
+        log('[System] Warning: gradlew script found but gradle-wrapper.jar is missing. Falling back to standalone Gradle 8.8 for stability.');
+      } else {
+        log('Gradlew not found, setting up standalone Gradle 8.8...');
+      }
       const gradleVersion = '8.8';
       const gradleDir = '/tmp/gradle';
       const gradleBin = path.join(gradleDir, `gradle-${gradleVersion}`, 'bin', 'gradle');
