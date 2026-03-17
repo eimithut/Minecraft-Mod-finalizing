@@ -222,7 +222,8 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
             if (!content.includes(repo.url) && !content.includes(repo.url.replace('https://', 'http://'))) {
               // Try to insert after repositories {
               if (content.includes('repositories {')) {
-                content = content.replace('repositories {', `repositories {\n    maven { url "${repo.url}" }`);
+                const repoLine = content.includes('.kts') ? `    maven("${repo.url}")` : `    maven { url "${repo.url}" }`;
+                content = content.replace('repositories {', `repositories {\n${repoLine}`);
                 modified = true;
               }
             }
@@ -245,7 +246,40 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
             content = content.replace('cloth_config_version=15.0.0', 'cloth_config_version=15.0.127');
             modified = true;
           }
+
+          // Force memory limits in gradle.properties to be safe
+          if (!content.includes('org.gradle.jvmargs')) {
+            content += '\norg.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC\n';
+            modified = true;
+          } else {
+            // Replace existing jvmargs if they are too high
+            content = content.replace(/org\.gradle\.jvmargs\s*=\s*.*/g, 'org.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC');
+            modified = true;
+          }
+
+          // Disable daemon and parallel in properties too
+          if (!content.includes('org.gradle.daemon')) {
+            content += '\norg.gradle.daemon=false\n';
+            modified = true;
+          }
+          if (!content.includes('org.gradle.parallel')) {
+            content += '\norg.gradle.parallel=false\n';
+            modified = true;
+          }
           
+          if (modified) {
+            await fs.writeFile(fullPath, content, 'utf8');
+          }
+        } else if (file === 'settings.gradle' || file === 'settings.gradle.kts') {
+          let content = await fs.readFile(fullPath, 'utf8');
+          let modified = false;
+
+          // Ensure repositories are also in settings.gradle for newer Gradle versions (pluginManagement)
+          if (content.includes('pluginManagement {') && !content.includes('mavenCentral()')) {
+            content = content.replace('pluginManagement {', 'pluginManagement {\n    repositories {\n        mavenCentral()\n        gradlePluginPortal()\n        maven { url "https://maven.fabricmc.net/" }\n    }');
+            modified = true;
+          }
+
           if (modified) {
             await fs.writeFile(fullPath, content, 'utf8');
           }
@@ -317,6 +351,15 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       buildCommand = `${gradleBin} build -x test --no-daemon --console=plain`;
     }
     
+    // Cleanup any existing Gradle lock files to prevent serialization/socket errors
+    try {
+      const gradleHome = '/tmp/.gradle';
+      if (await fs.pathExists(gradleHome)) {
+        log('Cleaning up Gradle lock files...');
+        const lockFiles = await execAsync(`find ${gradleHome} -name "*.lock" -delete`).catch(() => {});
+      }
+    } catch (e) {}
+
     job.message = 'Running Gradle build...';
     job.progress = 50;
     log(`Starting build with command: ${buildCommand}`);
@@ -331,7 +374,7 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         GRADLE_USER_HOME: '/tmp/.gradle',
         // Aggressively limit memory for 512MB RAM environments
         // -Xmx320m leaves room for the Node.js process and OS
-        GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"',
+        GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"',
         JAVA_OPTS: '-Xmx320m'
       }
     });
