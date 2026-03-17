@@ -447,8 +447,18 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
 
     await new Promise((resolve, reject) => {
       buildProcess.on('close', (code: number) => {
-        if (code === 0) resolve(null);
-        else reject(new Error(`Gradle build failed with exit code ${code}`));
+        if (code === 0) {
+          resolve(null);
+        } else {
+          // Check if the logs contain 'onrender' to provide more context
+          const hasOnRenderError = job.logs.some(l => l.toLowerCase().includes('onrender'));
+          if (hasOnRenderError) {
+            log('[System] Detected failure in "onrender" task. This is often caused by missing assets or incorrect rendering configuration in your mod.');
+            reject(new Error('Gradle build failed on "onrender" task. Please check your rendering code and asset paths.'));
+          } else {
+            reject(new Error(`Gradle build failed with exit code ${code}`));
+          }
+        }
       });
     });
 
