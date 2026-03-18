@@ -246,38 +246,6 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
             content = content.replace('cloth_config_version=15.0.0', 'cloth_config_version=15.0.127');
             modified = true;
           }
-
-          // Remove memory limits in gradle.properties to prevent single-use daemon forking
-          // We will control memory entirely via JAVA_OPTS
-          if (content.includes('org.gradle.jvmargs')) {
-            content = content.replace(/org\.gradle\.jvmargs\s*=\s*.*/g, '');
-            modified = true;
-          }
-
-          // Disable daemon and parallel in properties too
-          if (!content.includes('org.gradle.daemon')) {
-            content += '\norg.gradle.daemon=false\n';
-            modified = true;
-          }
-          if (!content.includes('org.gradle.parallel')) {
-            content += '\norg.gradle.parallel=false\n';
-            modified = true;
-          }
-          
-          // Disable configuration cache as it can cause serialization issues in low-memory
-          if (!content.includes('org.gradle.configuration-cache')) {
-            content += '\norg.gradle.configuration-cache=false\n';
-            modified = true;
-          } else {
-            content = content.replace(/org\.gradle\.configuration-cache\s*=\s*.*/g, 'org.gradle.configuration-cache=false');
-            modified = true;
-          }
-
-          // Disable VFS watching in properties
-          if (!content.includes('org.gradle.vfs.watch')) {
-            content += '\norg.gradle.vfs.watch=false\n';
-            modified = true;
-          }
           
           if (modified) {
             await fs.writeFile(fullPath, content, 'utf8');
@@ -312,6 +280,39 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       }
     }
     await patchProjectFiles(projectDir);
+
+    // Ensure gradle.properties exists and has the correct JVM args to prevent daemon forking
+    const gradlePropsPath = path.join(projectDir, 'gradle.properties');
+    let gradlePropsContent = '';
+    if (await fs.pathExists(gradlePropsPath)) {
+      gradlePropsContent = await fs.readFile(gradlePropsPath, 'utf8');
+    }
+    
+    // We MUST set org.gradle.jvmargs to EXACTLY match JAVA_OPTS, otherwise Gradle will fork a single-use
+    // daemon because the client JVM args won't match the requested daemon args, doubling memory usage!
+    if (!gradlePropsContent.includes('org.gradle.jvmargs')) {
+      gradlePropsContent += '\norg.gradle.jvmargs=-Xmx280m -XX:MaxMetaspaceSize=100m -XX:+UseSerialGC\n';
+    } else {
+      gradlePropsContent = gradlePropsContent.replace(/org\.gradle\.jvmargs\s*=\s*.*/g, 'org.gradle.jvmargs=-Xmx280m -XX:MaxMetaspaceSize=100m -XX:+UseSerialGC');
+    }
+    
+    // Disable daemon and parallel in properties too
+    if (!gradlePropsContent.includes('org.gradle.daemon')) {
+      gradlePropsContent += '\norg.gradle.daemon=false\n';
+    }
+    if (!gradlePropsContent.includes('org.gradle.parallel')) {
+      gradlePropsContent += '\norg.gradle.parallel=false\n';
+    }
+    if (!gradlePropsContent.includes('org.gradle.configuration-cache')) {
+      gradlePropsContent += '\norg.gradle.configuration-cache=false\n';
+    } else {
+      gradlePropsContent = gradlePropsContent.replace(/org\.gradle\.configuration-cache\s*=\s*.*/g, 'org.gradle.configuration-cache=false');
+    }
+    if (!gradlePropsContent.includes('org.gradle.vfs.watch')) {
+      gradlePropsContent += '\norg.gradle.vfs.watch=false\n';
+    }
+    
+    await fs.writeFile(gradlePropsPath, gradlePropsContent, 'utf8');
 
     // 4. Run gradle build
     log('Setting up build environment (JDK & Gradle)...');
@@ -387,8 +388,11 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
 
     if (await fs.pathExists(gradlewPath) && isWrapperJarValid) {
       log(`Found gradlew and valid wrapper JAR (${(await fs.stat(wrapperJarPath)).size} bytes), preparing execution...`);
-      const gradlewContent = await fs.readFile(gradlewPath, 'utf8');
-      await fs.writeFile(gradlewPath, gradlewContent.replace(/\r\n/g, '\n'));
+      let gradlewContent = await fs.readFile(gradlewPath, 'utf8');
+      gradlewContent = gradlewContent.replace(/\r\n/g, '\n');
+      // Strip DEFAULT_JVM_OPTS to prevent adding -Xmx64m -Xms64m, which causes daemon forks
+      gradlewContent = gradlewContent.replace(/DEFAULT_JVM_OPTS=.*/g, 'DEFAULT_JVM_OPTS=""');
+      await fs.writeFile(gradlewPath, gradlewContent);
       await execAsync(`chmod +x ${gradlewPath}`);
       buildCommand = './gradlew build -x test --no-daemon --console=plain';
     } else {
@@ -413,6 +417,13 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         let gradleZip = new AdmZip(zipPath);
         gradleZip.extractAllTo(gradleDir, true);
         await fs.remove(zipPath);
+        
+        // Strip DEFAULT_JVM_OPTS from the gradle script to prevent it from adding -Xmx64m -Xms64m
+        // This ensures the client JVM args match our requested daemon args perfectly, preventing a fork!
+        let scriptContent = await fs.readFile(gradleBin, 'utf8');
+        scriptContent = scriptContent.replace(/DEFAULT_JVM_OPTS=.*/g, 'DEFAULT_JVM_OPTS=""');
+        await fs.writeFile(gradleBin, scriptContent, 'utf8');
+        
         await execAsync(`chmod +x ${gradleBin}`);
       }
       
@@ -429,6 +440,8 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         await fs.remove(path.join(persistentGradleHome, 'workers')).catch(() => {});
         await fs.remove(path.join(persistentGradleHome, 'build-cache')).catch(() => {});
         await fs.remove(path.join(persistentGradleHome, 'caches', 'journal-1')).catch(() => {});
+        // Also wipe version-specific caches which might hold corrupted task history
+        await fs.remove(path.join(persistentGradleHome, 'caches', '8.8')).catch(() => {});
       }
       // Also wipe the project-level .gradle directory which contains configuration cache
       await fs.remove(path.join(projectDir, '.gradle')).catch(() => {});
@@ -447,11 +460,11 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         // Use a persistent Gradle home in the app root to cache dependencies across builds
         GRADLE_USER_HOME: persistentGradleHome,
         // Aggressively limit memory for 512MB RAM environments
-        // We MUST set org.gradle.jvmargs to EXACTLY match JAVA_OPTS, otherwise Gradle will fork a single-use
+        // We MUST set org.gradle.jvmargs in gradle.properties to EXACTLY match JAVA_OPTS, otherwise Gradle will fork a single-use
         // daemon because the client JVM args won't match the requested daemon args, doubling memory usage!
         // Disabled build caching as it causes serialization errors (tag 72) in constrained environments
-        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=false -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
-        JAVA_OPTS: '-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC'
+        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=false -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false`,
+        JAVA_OPTS: '-Xmx280m -XX:MaxMetaspaceSize=100m -XX:+UseSerialGC'
       }
     });
 
