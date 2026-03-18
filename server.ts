@@ -452,7 +452,15 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
 
     buildProcess.stdout.on('data', (data: any) => {
       data.toString().split('\n').forEach((line: string) => {
-        if (line.trim()) log(line.trim());
+        const trimmed = line.trim();
+        if (trimmed) {
+          // Capture lines that look like errors even if they are in stdout
+          if (trimmed.toLowerCase().includes('error:') || trimmed.includes('FAILED') || trimmed.includes('> Task :')) {
+            log(`[Error] ${trimmed}`);
+          } else {
+            log(trimmed);
+          }
+        }
       });
     });
 
@@ -473,9 +481,10 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
           const hasMemoryError = logs.includes('out of memory') || logs.includes('gc overhead limit exceeded');
           
           // Get the last few error lines for better diagnostics
+          // We take the last 10 lines to give more context, and filter for meaningful error messages
           const errorLines = job.logs
-            .filter(l => l.startsWith('[Error]'))
-            .slice(-5)
+            .filter(l => l.includes('[Error]') || l.includes('FAILED') || l.includes('Exception'))
+            .slice(-10)
             .join('\n');
 
           if (hasMemoryError) {
