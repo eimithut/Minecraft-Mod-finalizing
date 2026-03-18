@@ -321,6 +321,11 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     job.message = 'Setting up build environment...';
     job.progress = 40;
     
+    // Use a persistent Gradle home in the app root to cache dependencies across builds
+    // This is much better than /tmp because it persists across app restarts and doesn't use RAM-backed storage
+    const persistentGradleHome = path.join(process.cwd(), '.gradle_cache');
+    await fs.ensureDir(persistentGradleHome);
+    
     let buildCommand = '';
     const gradlewPath = path.join(projectDir, 'gradlew');
     
@@ -371,15 +376,27 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
       log(`[System] Gradle Wrapper detection: Found (${foundFiles.join(', ')}). Missing (${missingFiles.length > 0 ? missingFiles.join(', ') : 'none'}).`);
     }
 
-    if (await fs.pathExists(gradlewPath) && await fs.pathExists(path.join(projectDir, 'gradle', 'wrapper', 'gradle-wrapper.jar'))) {
-      log('Found gradlew and wrapper JAR, preparing execution...');
+    const wrapperJarPath = path.join(projectDir, 'gradle', 'wrapper', 'gradle-wrapper.jar');
+    let isWrapperJarValid = false;
+    if (await fs.pathExists(wrapperJarPath)) {
+      const stats = await fs.stat(wrapperJarPath);
+      // A valid gradle-wrapper.jar should be at least 50KB. If it's tiny, it's likely corrupted or a placeholder.
+      if (stats.size > 10000) {
+        isWrapperJarValid = true;
+      } else {
+        log(`[System] Warning: gradle-wrapper.jar found at ${wrapperJarPath} but it seems too small (${stats.size} bytes). It might be corrupted.`);
+      }
+    }
+
+    if (await fs.pathExists(gradlewPath) && isWrapperJarValid) {
+      log(`Found gradlew and valid wrapper JAR (${(await fs.stat(wrapperJarPath)).size} bytes), preparing execution...`);
       const gradlewContent = await fs.readFile(gradlewPath, 'utf8');
       await fs.writeFile(gradlewPath, gradlewContent.replace(/\r\n/g, '\n'));
       await execAsync(`chmod +x ${gradlewPath}`);
       buildCommand = './gradlew build -x test --no-daemon --console=plain';
     } else {
       if (await fs.pathExists(gradlewPath)) {
-        log('[System] Warning: gradlew script found but gradle-wrapper.jar is missing. Falling back to standalone Gradle 8.8 for stability.');
+        log(`[System] Warning: gradlew script found but gradle-wrapper.jar is ${isWrapperJarValid ? 'missing' : 'invalid/too small'}. Falling back to standalone Gradle 8.8 for stability.`);
       } else {
         log('Gradlew not found, setting up standalone Gradle 8.8...');
       }
@@ -407,10 +424,9 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     
     // Cleanup any existing Gradle lock files to prevent serialization/socket errors
     try {
-      const gradleHome = '/tmp/.gradle';
-      if (await fs.pathExists(gradleHome)) {
-        log('Cleaning up Gradle lock files...');
-        const lockFiles = await execAsync(`find ${gradleHome} -name "*.lock" -delete`).catch(() => {});
+      if (await fs.pathExists(persistentGradleHome)) {
+        log('Cleaning up Gradle lock files in persistent cache...');
+        await execAsync(`find ${persistentGradleHome} -name "*.lock" -delete`).catch(() => {});
       }
     } catch (e) {}
 
@@ -424,12 +440,13 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         ...process.env, 
         JAVA_HOME: javaHome, 
         PATH: pathEnv,
-        // Use a persistent Gradle home in /tmp to cache dependencies across builds
-        GRADLE_USER_HOME: '/tmp/.gradle',
+        // Use a persistent Gradle home in the app root to cache dependencies across builds
+        GRADLE_USER_HOME: persistentGradleHome,
         // Aggressively limit memory for 512MB RAM environments
-        // -Xmx320m leaves room for the Node.js process and OS
-        GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"',
-        JAVA_OPTS: '-Xmx320m'
+        // -Xmx360m leaves room for the Node.js process and OS
+        // Added build cache directory to the persistent home
+        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.caching.local.directory=${path.join(persistentGradleHome, 'build-cache')} -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx360m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
+        JAVA_OPTS: '-Xmx360m'
       }
     });
 
@@ -450,13 +467,25 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         if (code === 0) {
           resolve(null);
         } else {
-          // Check if the logs contain 'onrender' to provide more context
-          const hasOnRenderError = job.logs.some(l => l.toLowerCase().includes('onrender'));
-          if (hasOnRenderError) {
+          // Check if the logs contain 'onrender' or memory errors to provide more context
+          const logs = job.logs.join('\n').toLowerCase();
+          const hasOnRenderError = logs.includes('onrender');
+          const hasMemoryError = logs.includes('out of memory') || logs.includes('gc overhead limit exceeded');
+          
+          // Get the last few error lines for better diagnostics
+          const errorLines = job.logs
+            .filter(l => l.startsWith('[Error]'))
+            .slice(-5)
+            .join('\n');
+
+          if (hasMemoryError) {
+            log('[System] Build failed due to memory exhaustion. Minecraft mod builds are memory-intensive. I have increased the memory limit slightly, please try again.');
+            reject(new Error('Gradle build failed: Out of Memory. Please try again or simplify your mod.'));
+          } else if (hasOnRenderError) {
             log('[System] Detected failure in "onrender" task. This is often caused by missing assets or incorrect rendering configuration in your mod.');
-            reject(new Error('Gradle build failed on "onrender" task. Please check your rendering code and asset paths.'));
+            reject(new Error(`Gradle build failed on "onrender" task.\nRecent errors:\n${errorLines}`));
           } else {
-            reject(new Error(`Gradle build failed with exit code ${code}`));
+            reject(new Error(`Gradle build failed with exit code ${code}.\nRecent errors:\n${errorLines}`));
           }
         }
       });
