@@ -247,13 +247,10 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
             modified = true;
           }
 
-          // Force memory limits in gradle.properties to be safe
-          if (!content.includes('org.gradle.jvmargs')) {
-            content += '\norg.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC\n';
-            modified = true;
-          } else {
-            // Replace existing jvmargs if they are too high
-            content = content.replace(/org\.gradle\.jvmargs\s*=\s*.*/g, 'org.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC');
+          // Remove memory limits in gradle.properties to prevent single-use daemon forking
+          // We will control memory entirely via JAVA_OPTS
+          if (content.includes('org.gradle.jvmargs')) {
+            content = content.replace(/org\.gradle\.jvmargs\s*=\s*.*/g, '');
             modified = true;
           }
 
@@ -429,9 +426,12 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         await execAsync(`find ${persistentGradleHome} -name "*.lock" -delete`).catch(() => {});
         // Aggressively wipe daemon state and build cache to fix "Unexpected type tag 72" errors
         await fs.remove(path.join(persistentGradleHome, 'daemon')).catch(() => {});
+        await fs.remove(path.join(persistentGradleHome, 'workers')).catch(() => {});
         await fs.remove(path.join(persistentGradleHome, 'build-cache')).catch(() => {});
         await fs.remove(path.join(persistentGradleHome, 'caches', 'journal-1')).catch(() => {});
       }
+      // Also wipe the project-level .gradle directory which contains configuration cache
+      await fs.remove(path.join(projectDir, '.gradle')).catch(() => {});
     } catch (e) {}
 
     job.message = 'Running Gradle build...';
@@ -447,10 +447,11 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         // Use a persistent Gradle home in the app root to cache dependencies across builds
         GRADLE_USER_HOME: persistentGradleHome,
         // Aggressively limit memory for 512MB RAM environments
-        // -Xmx360m leaves room for the Node.js process and OS
+        // We MUST set org.gradle.jvmargs to EXACTLY match JAVA_OPTS, otherwise Gradle will fork a single-use
+        // daemon because the client JVM args won't match the requested daemon args, doubling memory usage!
         // Disabled build caching as it causes serialization errors (tag 72) in constrained environments
-        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=false -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx360m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
-        JAVA_OPTS: '-Xmx360m'
+        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=false -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
+        JAVA_OPTS: '-Xmx320m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC'
       }
     });
 
