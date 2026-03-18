@@ -425,8 +425,12 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
     // Cleanup any existing Gradle lock files to prevent serialization/socket errors
     try {
       if (await fs.pathExists(persistentGradleHome)) {
-        log('Cleaning up Gradle lock files in persistent cache...');
+        log('Cleaning up Gradle lock files and potentially corrupted caches...');
         await execAsync(`find ${persistentGradleHome} -name "*.lock" -delete`).catch(() => {});
+        // Aggressively wipe daemon state and build cache to fix "Unexpected type tag 72" errors
+        await fs.remove(path.join(persistentGradleHome, 'daemon')).catch(() => {});
+        await fs.remove(path.join(persistentGradleHome, 'build-cache')).catch(() => {});
+        await fs.remove(path.join(persistentGradleHome, 'caches', 'journal-1')).catch(() => {});
       }
     } catch (e) {}
 
@@ -444,8 +448,8 @@ async function runBuildJob(jobId: string, workDir: string, sourceZipPath: string
         GRADLE_USER_HOME: persistentGradleHome,
         // Aggressively limit memory for 512MB RAM environments
         // -Xmx360m leaves room for the Node.js process and OS
-        // Added build cache directory to the persistent home
-        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=true -Dorg.gradle.caching.local.directory=${path.join(persistentGradleHome, 'build-cache')} -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx360m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
+        // Disabled build caching as it causes serialization errors (tag 72) in constrained environments
+        GRADLE_OPTS: `-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.caching=false -Dorg.gradle.workers.max=1 -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false -Dorg.gradle.jvmargs="-Xmx360m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"`,
         JAVA_OPTS: '-Xmx360m'
       }
     });
